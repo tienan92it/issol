@@ -1,11 +1,12 @@
 import os
 import sys
-import base64
+import fnmatch
 import re
 from github import Github, GithubException
 from git import Repo
 from git.exc import InvalidGitRepositoryError
 from .config_utils import get_or_prompt_token
+from .ignore_patterns import IGNORE_PATTERNS
 
 def get_github_client():
     github_token = get_or_prompt_token('GITHUB_TOKEN', "Please enter your GitHub Personal Access Token")
@@ -22,13 +23,17 @@ def get_repo_info():
         repo = Repo(os.getcwd(), search_parent_directories=True)
         remote_url = repo.remotes.origin.url
         if remote_url.startswith('https://'):
-            # HTTPS URL format
             parts = remote_url.split('/')
-            return f"{parts[-2]}/{parts[-1].rstrip('.git')}"
+            repo_name = f"{parts[-2]}/{parts[-1].rstrip('.git')}"
         else:
-            # SSH URL format
             parts = remote_url.split(':')
-            return parts[-1].rstrip('.git')
+            repo_name = parts[-1].rstrip('.git')
+        
+        current_branch = repo.active_branch.name
+        print(f"Repository: {repo_name}")
+        print(f"Current branch: {current_branch}")
+        
+        return repo_name, current_branch
     except InvalidGitRepositoryError:
         print("Error: Not a git repository. Please run this command from within a git repository.")
         sys.exit(1)
@@ -36,16 +41,62 @@ def get_repo_info():
         print(f"Error determining repository info: {str(e)}")
         sys.exit(1)
 
-def scan_codebase(repo, branch='main'):
-    context = ""
-    files_to_read = ["README.md", "codebase.md"]
+def parse_gitignore():
+    gitignore_patterns = IGNORE_PATTERNS.copy()
+    if os.path.exists('.gitignore'):
+        with open('.gitignore', 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    gitignore_patterns.append(line)
+    return gitignore_patterns
+
+def should_ignore(path, gitignore_patterns):
+    path = os.path.normpath(path)
     
-    for file_name in files_to_read:
-        try:
-            file_content = get_file_content(file_name)
-            context += f"File: {file_name} (branch: {branch})\n\n{file_content}\n\n"
-        except Exception as e:
-            print(f"Error reading {file_name}: {str(e)}")
+    path_parts = path.split(os.sep)
+    for i in range(len(path_parts)):
+        partial_path = os.sep.join(path_parts[:i+1])
+        if any(fnmatch.fnmatch(partial_path, pattern) for pattern in gitignore_patterns):
+            return True
+        
+        if any(fnmatch.fnmatch(path_parts[i], pattern) for pattern in gitignore_patterns):
+            return True
+    
+    return False
+
+def get_file_content(file_path, gitignore_patterns):
+    if should_ignore(file_path, gitignore_patterns):
+        print(f"Ignoring file: {file_path}")
+        return ""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            return file.read()
+    except FileNotFoundError:
+        print(f"File not found: {file_path}")
+        return ""
+    except Exception as e:
+        print(f"Error reading file {file_path}: {str(e)}")
+        return ""
+
+def scan_codebase(repo, branch):
+    context = ""
+    gitignore_patterns = parse_gitignore()
+    
+    print("Gitignore patterns:", gitignore_patterns)
+    print(f"Scanning branch: {branch}")
+    
+    for root, dirs, files in os.walk('.', topdown=True):
+        dirs[:] = [d for d in dirs if not should_ignore(os.path.join(root, d), gitignore_patterns)]
+        
+        for file in files:
+            file_path = os.path.join(root, file)
+            if not should_ignore(file_path, gitignore_patterns):
+                file_content = get_file_content(file_path, gitignore_patterns)
+                if file_content:
+                    context += f"File: {file_path} (branch: {branch})\n\n{file_content}\n\n"
+            else:
+                print(f"Ignoring file: {file_path}")
     
     return context
 
@@ -78,12 +129,12 @@ def extract_issue_content(body):
         
         if current_section:
             if current_section == 'affected_files':
-                if ':' in line:  # Skip the header line
+                if ':' in line:
                     continue
                 if line and not any(header in line for header in sum(headers.values(), [])):
                     content[current_section].append(line)
             else:
-                if ':' in line:  # Skip the header line
+                if ':' in line:
                     continue
                 content[current_section] += line + ' '
     
@@ -99,15 +150,6 @@ def create_branch_name(title):
     name = re.sub(r'[^a-zA-Z0-9\s-]', '', title.lower())
     name = re.sub(r'\s+', '-', name)
     return name[:50]
-
-def get_file_content(repo, file_path, branch):
-    print(f"Debug: get_file_content called with repo={repo}, file_path={file_path}, branch={branch}")
-    try:
-        file_content = repo.get_contents(file_path, ref=branch)
-        return base64.b64decode(file_content.content).decode('utf-8')
-    except Exception as e:
-        print(f"Debug: Error in get_file_content: {str(e)}")
-        return ""
 
 def clean_generated_code(content):
     # Remove any lines that start with '#' (comments)
@@ -137,7 +179,7 @@ def create_pull_request(repo, issue, generated_code, base_branch, issue_content)
             print(f"Created new branch: {new_branch_name}")
             break
         except GithubException as e:
-            if e.status == 422:  # Reference already exists
+            if e.status == 422:
                 print(f"Branch {new_branch_name} already exists. Trying a new name...")
                 new_branch_name = f"{base_branch_name}-{counter}"
                 counter += 1
@@ -146,17 +188,15 @@ def create_pull_request(repo, issue, generated_code, base_branch, issue_content)
                 raise
 
     file_contents = {}
-    current_file = None
     print("Processing generated code:")
     print(generated_code)
     
-    # Split the generated code into sections for each file
     file_sections = re.split(r'# File: ', generated_code)
-    for section in file_sections[1:]:  # Skip the first empty section
+    for section in file_sections[1:]:
         lines = section.split('\n')
         file_path = lines[0].strip()
         content = '\n'.join(lines[1:])
-        file_contents[file_path] = clean_generated_code(content)
+        file_contents[file_path] = clean_generated_code(content)  # Apply cleaning here
 
     if not file_contents:
         print("Error: No file contents were extracted from the generated code.")
@@ -174,12 +214,17 @@ Changes made:
 """
 
     changes_made = False
+    gitignore_patterns = parse_gitignore()
     print(f"Processing {len(file_contents)} files...")
     for file_path, new_content in file_contents.items():
-        print(f"\nProcessing file: {file_path}")
-        original_content = get_file_content(file_path)
+        if should_ignore(file_path, gitignore_patterns):
+            print(f"\nSkipping ignored file: {file_path}")
+            continue
         
-        print("AI suggested content (after cleaning):")
+        print(f"\nProcessing file: {file_path}")
+        original_content = get_file_content(file_path, gitignore_patterns)
+        
+        print("AI suggested content:")
         print(new_content)
         print("\nExisting content:")
         print(original_content)
@@ -207,10 +252,6 @@ Changes made:
 
     if not changes_made:
         print("\nNo changes were made to any files. Skipping pull request creation.")
-        print("Possible reasons:")
-        print("1. The AI's suggested code is identical to the existing code.")
-        print("2. The AI didn't generate any code changes for the specified files.")
-        print("3. The issue description might not have provided enough information for the AI to suggest concrete changes.")
         try:
             repo.get_git_ref(f"heads/{new_branch_name}").delete()
             print(f"Deleted branch {new_branch_name} as it contained no changes.")

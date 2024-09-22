@@ -1,5 +1,4 @@
-import os
-from ..utils.github_utils import extract_issue_content, create_pull_request, scan_codebase
+from ..utils.github_utils import extract_issue_content, create_pull_request, scan_codebase, get_repo_info
 from ..utils.ai_utils import generate_code
 
 def run(repo, issue_number, branch):
@@ -63,14 +62,3 @@ def process_issue(repo, issue, branch):
         return
 
     create_pull_request(repo, issue, generated_code, branch, issue_content)
-
-def get_file_content(file_path):
-    try:
-        with open(file_path, 'r') as file:
-            return file.read()
-    except FileNotFoundError:
-        print(f"File not found: {file_path}")
-        return ""
-    except Exception as e:
-        print(f"Error reading file {file_path}: {str(e)}")
-        return ""
